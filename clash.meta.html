@@ -3075,9 +3075,199 @@ module.exports.generate = (config, { yaml }) => {
                         } else {
                             throw new Error('SUBSCRIPTION_URL'); // 特殊标识，由 Editor 处理 fetch
                         }
+                    } else if (this.isQXProxyLine(link)) {
+                        return this.parseQXProxy(link);
                     } else {
                         throw new Error('不支持的协议格式: ' + link.substring(0, 20) + '...');
                     }
+                }
+
+                // 判断是否为 QuantumultX 格式的节点行
+                // 格式: name=type,server,port,...
+                isQXProxyLine(line) {
+                    const eqIdx = line.indexOf('=');
+                    if (eqIdx < 0) return false;
+                    const afterEq = line.substring(eqIdx + 1).trimStart();
+                    const qxTypes = ['hysteria2,', 'hysteria,', 'ss,', 'vmess,', 'vless,', 'trojan,', 'shadowsocks,'];
+                    return qxTypes.some(t => afterEq.startsWith(t));
+                }
+
+                // 解析 QuantumultX 节点行格式
+                // 格式: 节点名=type,server,port,key=value,...
+                parseQXProxy(line) {
+                    const eqIdx = line.indexOf('=');
+                    if (eqIdx < 0) throw new Error('QX 格式解析失败: 未找到 =');
+
+                    const name = line.substring(0, eqIdx).trim();
+                    const body = line.substring(eqIdx + 1).trim();
+
+                    // 解析方法: 按逗号分割，但要尊重引号内的逗号
+                    const parts = this._splitQXParts(body);
+                    if (parts.length < 3) throw new Error('QX 格式内容不足');
+
+                    const type = parts[0].toLowerCase();
+                    const server = parts[1];
+                    const port = parseInt(parts[2]);
+
+                    // 解析 key=value 参数对
+                    const params = {};
+                    for (let i = 3; i < parts.length; i++) {
+                        const kv = parts[i];
+                        const kidx = kv.indexOf('=');
+                        if (kidx < 0) continue;
+                        const k = kv.substring(0, kidx).trim();
+                        let v = kv.substring(kidx + 1).trim();
+                        // 去掉引号
+                        if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+                            v = v.slice(1, -1);
+                        }
+                        params[k] = v;
+                    }
+
+                    // 构建基础节点对象
+                    const proxy = { name, server, port, udp: true };
+
+                    if (params['udp-relay'] === 'true') proxy.udp = true;
+
+                    switch (type) {
+                        case 'hysteria2': {
+                            proxy.type = 'hysteria2';
+                            if (params.password) proxy.password = params.password;
+                            if (params.sni) proxy.sni = params.sni;
+                            if (params['skip-cert-verify'] === 'true') proxy['skip-cert-verify'] = true;
+                            if (params.obfs) proxy.obfs = params.obfs;
+                            if (params['obfs-password']) proxy['obfs-password'] = params['obfs-password'];
+                            if (params.alpn) proxy.alpn = params.alpn.split(',');
+                            if (params.up) proxy.up = params.up;
+                            if (params.down) proxy.down = params.down;
+                            break;
+                        }
+                        case 'hysteria': {
+                            proxy.type = 'hysteria';
+                            if (params.password || params.auth) proxy.auth = params.password || params.auth;
+                            if (params.sni) proxy.sni = params.sni;
+                            if (params['skip-cert-verify'] === 'true') proxy['skip-cert-verify'] = true;
+                            if (params.obfs) proxy.obfs = params.obfs;
+                            if (params.up) proxy.up = params.up;
+                            if (params.down) proxy.down = params.down;
+                            break;
+                        }
+                        case 'ss':
+                        case 'shadowsocks': {
+                            proxy.type = 'ss';
+                            proxy.cipher = params['encrypt-method'] || params.method || 'aes-256-gcm';
+                            proxy.password = params.password || '';
+                            if (params.obfs) {
+                                proxy.plugin = 'obfs';
+                                proxy['plugin-opts'] = { mode: params.obfs, host: params['obfs-host'] || '' };
+                            }
+                            break;
+                        }
+                        case 'vmess': {
+                            proxy.type = 'vmess';
+                            proxy.uuid = params.username || params.uuid || '';
+                            proxy.alterId = 0;
+                            // vmess-aead=false 对应 alterId 非零的老协议模式
+                            // 但 Clash 的 vmess 不依赖 alterId 控制 AEAD，直接写 0 即可
+                            proxy.cipher = params.cipher || 'auto';
+                            proxy.tls = params.tls === 'true';
+                            if (proxy.tls) {
+                                proxy.servername = params.sni || server;
+                                proxy['skip-cert-verify'] = params['skip-cert-verify'] === 'true';
+                            } else if (params['skip-cert-verify'] === 'true') {
+                                proxy['skip-cert-verify'] = true;
+                            }
+                            // WebSocket 传输层
+                            if (params.ws === 'true') {
+                                proxy.network = 'ws';
+                                const wsPath = params['ws-path'] || '/';
+                                // 解析 ws-headers=Host:"..."
+                                let wsHost = '';
+                                if (params['ws-headers']) {
+                                    const hostMatch = params['ws-headers'].match(/Host:\s*"?([^"]+)"?/i);
+                                    if (hostMatch) wsHost = hostMatch[1];
+                                }
+                                proxy['ws-opts'] = { path: wsPath, headers: { Host: wsHost || server } };
+                            }
+                            // gRPC 传输层
+                            if (params.grpc === 'true' || params['grpc-service-name']) {
+                                proxy.network = 'grpc';
+                                proxy['grpc-opts'] = {
+                                    'grpc-service-name': params['grpc-service-name'] || ''
+                                };
+                            }
+                            break;
+                        }
+                        case 'trojan': {
+                            proxy.type = 'trojan';
+                            proxy.password = params.password || '';
+                            proxy.tls = true;
+                            proxy.sni = params.sni || server;
+                            if (params['skip-cert-verify'] === 'true') proxy['skip-cert-verify'] = true;
+                            if (params.ws === 'true') {
+                                proxy.network = 'ws';
+                                const wsPath = params['ws-path'] || '/';
+                                let wsHost = '';
+                                if (params['ws-headers']) {
+                                    const hostMatch = params['ws-headers'].match(/Host:\s*"?([^"]+)"?/i);
+                                    if (hostMatch) wsHost = hostMatch[1];
+                                }
+                                proxy['ws-opts'] = { path: wsPath, headers: { Host: wsHost || server } };
+                            }
+                            break;
+                        }
+                        case 'vless': {
+                            proxy.type = 'vless';
+                            proxy.uuid = params.username || params.uuid || '';
+                            proxy.cipher = 'none';
+                            if (params.flow) proxy.flow = params.flow;
+                            proxy.tls = params.tls === 'true';
+                            if (params.sni) proxy.sni = params.sni;
+                            if (params['skip-cert-verify'] === 'true') proxy['skip-cert-verify'] = true;
+                            if (params.ws === 'true' || params.transport === 'ws') {
+                                proxy.network = 'ws';
+                                const wsPath = params['ws-path'] || '/';
+                                let wsHost = '';
+                                if (params['ws-headers']) {
+                                    const hostMatch = params['ws-headers'].match(/Host:\s*"?([^"]+)"?/i);
+                                    if (hostMatch) wsHost = hostMatch[1];
+                                }
+                                proxy['ws-opts'] = { path: wsPath, headers: { Host: wsHost || server } };
+                            }
+                            break;
+                        }
+                        default:
+                            throw new Error(`QX 格式中不支持的协议类型: ${type}`);
+                    }
+
+                    return proxy;
+                }
+
+                // 将 QX 行按逗号拆分，但保留引号内的逗号
+                _splitQXParts(str) {
+                    const parts = [];
+                    let current = '';
+                    let inQuote = false;
+                    let quoteChar = '';
+
+                    for (let i = 0; i < str.length; i++) {
+                        const ch = str[i];
+                        if (!inQuote && (ch === '"' || ch === "'")) {
+                            inQuote = true;
+                            quoteChar = ch;
+                            current += ch;
+                        } else if (inQuote && ch === quoteChar) {
+                            inQuote = false;
+                            current += ch;
+                        } else if (!inQuote && ch === ',') {
+                            parts.push(current.trim());
+                            current = '';
+                        } else {
+                            current += ch;
+                        }
+                    }
+                    if (current.trim()) parts.push(current.trim());
+                    return parts;
                 }
 
                 unindent(text) {
@@ -3462,10 +3652,11 @@ module.exports.generate = (config, { yaml }) => {
                             name: config.ps || name,
                             type: 'vmess',
                             server: config.add || '',
-                            port: config.port, // 保持原始格式（字符串或数字）
+                            // 兼容字段错误/混淆（如 p?rt、prt 等损形）
+                            port: parseInt(config.port || config['p?rt'] || config.prt || config.po || 0),
                             uuid: config.id || '',
                             alterId: parseInt(config.aid) || 0,
-                            cipher: config.scy || 'auto',
+                            cipher: config.scy || config.security || 'auto',
                             tls: config.tls === 'tls',
                             network: config.net || 'tcp',
                             udp: true
@@ -3639,39 +3830,57 @@ module.exports.generate = (config, { yaml }) => {
                     try {
                         let content = link.substring(5);
                         let name = 'Shadowsocks节点';
+                        let pluginStr = '';
 
                         if (content.includes('#')) {
-                            const parts = content.split('#');
-                            content = parts[0];
-                            name = decodeURIComponent(parts[1]);
+                            const hashIdx = content.indexOf('#');
+                            name = decodeURIComponent(content.substring(hashIdx + 1));
+                            content = content.substring(0, hashIdx);
                         }
 
-                        // 检查是否是 SIP002 格式
+                        // 提取插件参数（? 后面部分）
+                        if (content.includes('?')) {
+                            const qIdx = content.indexOf('?');
+                            pluginStr = content.substring(qIdx + 1);
+                            content = content.substring(0, qIdx);
+                        }
+
+                        let method, password, server, port;
+
                         if (content.includes('@')) {
-                            // SIP002 格式: method:password@server:port
-                            const atIndex = content.indexOf('@');
-                            const methodPass = content.substring(0, atIndex);
+                            // SIP002 格式：userinfo@host:port
+                            // userinfo 可能是明文 method:password 或 Base64(method:password)
+                            const atIndex = content.lastIndexOf('@');
+                            let userinfo = content.substring(0, atIndex);
                             const serverPort = content.substring(atIndex + 1);
 
-                            const colonIndex = methodPass.indexOf(':');
-                            const method = decodeURIComponent(methodPass.substring(0, colonIndex));
-                            const password = decodeURIComponent(methodPass.substring(colonIndex + 1));
+                            // 尝试判断 userinfo 是否经过 Base64 编码（不含冒号的则尝试解码）
+                            if (!userinfo.includes(':')) {
+                                try {
+                                    const decoded = this.base64Decode(userinfo);
+                                    if (decoded.includes(':')) userinfo = decoded;
+                                } catch (e) { /* 不是 base64，保持原样 */ }
+                            } else {
+                                // 含冒号但整体也可能是 base64，尝试解码后校验格式
+                                try {
+                                    const decoded = this.base64Decode(userinfo);
+                                    // 合法的解码结果形如 method:password，method 不含空格
+                                    if (decoded.includes(':') && !decoded.split(':')[0].includes(' ')) {
+                                        userinfo = decoded;
+                                    }
+                                } catch (e) { /* 解码失败，保持 URI decode */ }
+                                userinfo = decodeURIComponent(userinfo);
+                            }
 
-                            const colonIndex2 = serverPort.lastIndexOf(':');
-                            const server = serverPort.substring(0, colonIndex2);
-                            const port = parseInt(serverPort.substring(colonIndex2 + 1));
+                            const colonIdx = userinfo.indexOf(':');
+                            method = userinfo.substring(0, colonIdx);
+                            password = userinfo.substring(colonIdx + 1);
 
-                            return {
-                                name: name,
-                                type: 'ss',
-                                server: server,
-                                port: port,
-                                cipher: method,
-                                password: password,
-                                udp: true
-                            };
+                            const colonIdx2 = serverPort.lastIndexOf(':');
+                            server = serverPort.substring(0, colonIdx2);
+                            port = parseInt(serverPort.substring(colonIdx2 + 1));
                         } else {
-                            // 传统 base64 格式
+                            // 传统整体 Base64 格式：ss://BASE64
                             const decoded = this.base64Decode(content);
                             const atIndex = decoded.indexOf('@');
                             if (atIndex === -1) throw new Error('SS链接格式错误');
@@ -3680,23 +3889,39 @@ module.exports.generate = (config, { yaml }) => {
                             const serverPort = decoded.substring(atIndex + 1);
 
                             const colonIndex = methodPass.indexOf(':');
-                            const method = methodPass.substring(0, colonIndex);
-                            const password = methodPass.substring(colonIndex + 1);
+                            method = methodPass.substring(0, colonIndex);
+                            password = methodPass.substring(colonIndex + 1);
 
                             const colonIndex2 = serverPort.lastIndexOf(':');
-                            const server = serverPort.substring(0, colonIndex2);
-                            const port = parseInt(serverPort.substring(colonIndex2 + 1));
-
-                            return {
-                                name: name,
-                                type: 'ss',
-                                server: server,
-                                port: port,
-                                cipher: method,
-                                password: password,
-                                udp: true
-                            };
+                            server = serverPort.substring(0, colonIndex2);
+                            port = parseInt(serverPort.substring(colonIndex2 + 1));
                         }
+
+                        const result = {
+                            name: name,
+                            type: 'ss',
+                            server: server,
+                            port: port,
+                            cipher: method,
+                            password: password,
+                            udp: true
+                        };
+
+                        // 解析插件参数
+                        if (pluginStr) {
+                            const pluginParams = new URLSearchParams(pluginStr);
+                            const plugin = pluginParams.get('plugin');
+                            if (plugin) {
+                                result.plugin = plugin.split(';')[0];
+                                result['plugin-opts'] = {};
+                                plugin.split(';').slice(1).forEach(p => {
+                                    const [k, v] = p.split('=');
+                                    if (k && v !== undefined) result['plugin-opts'][k] = v;
+                                });
+                            }
+                        }
+
+                        return result;
                     } catch (e) {
                         throw new Error('SS解析失败: ' + e.message);
                     }
@@ -3786,10 +4011,14 @@ module.exports.generate = (config, { yaml }) => {
                             udp: true
                         };
 
+                        // 兼容 userinfo 段携带密码的格式（部分客户端生成）
+                        if (url.username) result.auth = decodeURIComponent(url.username);
+
                         url.searchParams.forEach((value, key) => {
                             if (key === 'auth') {
                                 result.auth = decodeURIComponent(value);
-                            } else if (key === 'peer') {
+                            } else if (key === 'peer' || key === 'sni') {
+                                // 兼容两种 SNI 字段名：peer (旧版) 和 sni (新版)
                                 result.sni = decodeURIComponent(value);
                             } else if (key === 'insecure') {
                                 result['skip-cert-verify'] = value === '1';
@@ -3797,7 +4026,7 @@ module.exports.generate = (config, { yaml }) => {
                                 result.alpn = decodeURIComponent(value).split(',');
                             } else if (key === 'obfs') {
                                 result.obfs = decodeURIComponent(value);
-                            } else if (key === 'obfsParam') {
+                            } else if (key === 'obfsParam' || key === 'obfs-param') {
                                 result['obfs-param'] = decodeURIComponent(value);
                             } else if (key === 'upmbps') {
                                 result.up = value + ' Mbps';
@@ -3814,7 +4043,24 @@ module.exports.generate = (config, { yaml }) => {
 
                 parseHysteria2(link) {
                     try {
-                        const url = new URL(link);
+                        // 处理密码含断行符 / 的问题：URL 中 userinfo 的 / 会被解析为路径分隔符
+                        // 解决方案：把协议换为 https，然后尝试解析
+                        // 为了安全解析含断行符的密码，需要异拥治理：
+                        // 在 @ 前的 userinfo 部分中将 / 替换为 %2F
+                        let safeLink = link;
+                        const protoEnd = link.indexOf('://') + 3;
+                        const atIdx = link.lastIndexOf('@');
+                        if (atIdx > protoEnd) {
+                            const userinfo = link.substring(protoEnd, atIdx);
+                            const rest = link.substring(atIdx);
+                            // 如果密码未经编码且含断行符
+                            if (userinfo.includes('/') && !userinfo.includes('%2F')) {
+                                const encodedUserinfo = userinfo.replace(/\//g, '%2F');
+                                safeLink = link.substring(0, protoEnd) + encodedUserinfo + rest;
+                            }
+                        }
+
+                        const url = new URL(safeLink.replace(/^hysteria2:\/\//i, 'https://').replace(/^hy2:\/\//i, 'https://'));
                         const server = url.hostname;
                         const port = parseInt(url.port) || 443;
                         const name = decodeURIComponent(url.hash.substring(1)) || 'Hysteria2节点';
@@ -3828,9 +4074,15 @@ module.exports.generate = (config, { yaml }) => {
                             udp: true
                         };
 
+                        // 标准格式：hysteria2://password@host:port  密码在 userinfo 段
+                        if (url.username) {
+                            result.password = decodeURIComponent(url.username);
+                        }
+
                         url.searchParams.forEach((value, key) => {
                             if (key === 'auth' || key === 'password') {
-                                result.password = decodeURIComponent(value);
+                                // query 中的密码参数兑底（非标准但部分工具生成）
+                                if (!result.password) result.password = decodeURIComponent(value);
                             } else if (key === 'sni') {
                                 result.sni = decodeURIComponent(value);
                             } else if (key === 'insecure') {
@@ -4177,32 +4429,70 @@ module.exports.generate = (config, { yaml }) => {
                     if (p.network) params.set('type', p.network);
                     if (p.alpn) params.set('alpn', Array.isArray(p.alpn) ? p.alpn.join(',') : p.alpn);
 
+                    // WS 传输参数
+                    const wsPath = p.wsPath || p['ws-opts']?.path;
+                    const wsHost = p.wsHost || p['ws-opts']?.headers?.Host;
+                    if (wsPath) params.set('path', wsPath);
+                    if (wsHost) params.set('host', wsHost);
+
+                    // gRPC 传输参数
+                    const grpcName = p['grpc-opts']?.['grpc-service-name'];
+                    if (grpcName) params.set('serviceName', grpcName);
+
                     let query = params.toString();
-                    return `trojan://${p.password}@${p.server}:${p.port}${query ? '?' + query : ''}#${encodeURIComponent(p.name)}`;
+                    return `trojan://${encodeURIComponent(p.password)}@${p.server}:${p.port}${query ? '?' + query : ''}#${encodeURIComponent(p.name)}`;
                 }
 
                 buildHysteriaLink(p) {
                     const protocol = p.type === 'hysteria2' ? 'hysteria2' : 'hysteria';
                     const params = new URLSearchParams();
-                    const auth = p.password || p.auth;
-                    if (auth) params.set(p.type === 'hysteria2' ? 'password' : 'auth', auth);
-                    if (p.sni || p.servername) params.set('sni', p.sni || p.servername);
-                    if (p['skip-cert-verify']) params.set('insecure', '1');
-                    if (p.obfs) params.set('obfs', p.obfs);
 
+                    // 1. 处理认证：Hysteria2 密码放在 URI userinfo 段，Hysteria1 放在 auth 查询参数
+                    const auth = p.password || p.auth;
+
+                    // 2. 处理 SNI（连接成功的关键）
+                    const sni = p.sni || p.servername;
+                    if (sni) params.set('sni', sni);
+
+                    // 3. 处理跳过证书验证（兼容两种字段名）
+                    if (p['skip-cert-verify'] || p.insecure) {
+                        params.set('insecure', '1');
+                    }
+
+                    // 4. Hysteria1 专用：auth 放入查询参数
+                    if (p.type !== 'hysteria2' && auth) {
+                        params.set('auth', auth);
+                    }
+
+                    // 5. Hysteria2 专用：obfs 混淆参数
+                    if (p.type === 'hysteria2') {
+                        if (p.obfs) {
+                            params.set('obfs', p.obfs);
+                            if (p['obfs-password']) params.set('obfs-password', p['obfs-password']);
+                        }
+                    }
+
+                    // 6. 构造最终链接
+                    //    Hysteria2: hysteria2://password@host:port?params#name
+                    //    Hysteria1: hysteria://host:port?auth=...&params#name
+                    const userinfo = p.type === 'hysteria2' && auth ? `${encodeURIComponent(auth)}@` : '';
                     let query = params.toString();
-                    return `${protocol}://${p.server}:${p.port}${query ? '?' + query : ''}#${encodeURIComponent(p.name)}`;
+                    return `${protocol}://${userinfo}${p.server}:${p.port}${query ? '?' + query : ''}#${encodeURIComponent(p.name)}`;
                 }
 
                 buildTuicLink(p) {
+                    // TUIC 标准格式：tuic://uuid:password@host:port?params
+                    // uuid 和 password 放在 userinfo 段，多数客户端（SR/QX）均以此为准
                     const params = new URLSearchParams();
-                    params.set('version', p.version || 5);
-                    if (p.password) params.set('password', p.password);
                     if (p.sni || p.servername) params.set('sni', p.sni || p.servername);
                     if (p['skip-cert-verify']) params.set('allowInsecure', '1');
                     if (p.alpn) params.set('alpn', Array.isArray(p.alpn) ? p.alpn.join(',') : p.alpn);
+                    if (p.version) params.set('version', p.version);
+                    if (p['congestion-controller']) params.set('congestion_control', p['congestion-controller']);
 
-                    return `tuic://${p.uuid}@${p.server}:${p.port}?${params.toString()}#${encodeURIComponent(p.name)}`;
+                    const userinfo = `${encodeURIComponent(p.uuid || '')}:${encodeURIComponent(p.password || '')}`;
+                    let query = params.toString();
+                    return `tuic://${userinfo}@${p.server}:${p.port}${query ? '?' + query : ''}#${encodeURIComponent(p.name)}`;
                 }
 
                 buildSnellLink(p) {
@@ -5446,8 +5736,10 @@ module.exports.generate = (config, { yaml }) => {
                             }
                         }
 
-                        // 批量解析普通链接
-                        const lines = input.split('\n').map(l => l.trim()).filter(l => l);
+                        // 批量解析普通链接（过滤空行和 # 开头的注释行）
+                        const lines = input.split('\n')
+                            .map(l => l.trim())
+                            .filter(l => l && !l.startsWith('#'));
                         const allProxies = [];
                         const allErrors = [];
 
@@ -7296,6 +7588,19 @@ module.exports.generate = (config, { yaml }) => {
                             if (proxy.echCode) parts.push(`ech-config: ${this.quoteYaml(proxy.echCode)}`);
                         }
                         parts.push(`skip-cert-verify: ${proxy['skip-cert-verify'] !== undefined ? proxy['skip-cert-verify'] : false}`);
+                    }
+
+                    // Hysteria2/Hysteria 的 sni 和 skip-cert-verify 不依赖 tls: true 字段
+                    // 这两种协议内置是 TLS，但 Clash 配置中不需要显式写 tls: true
+                    if (proxy.type === 'hysteria2' || proxy.type === 'hysteria') {
+                        const sni = proxy.sni || proxy.servername;
+                        if (sni) parts.push(`sni: ${sni}`);
+                        if (proxy['skip-cert-verify'] !== undefined) {
+                            parts.push(`skip-cert-verify: ${proxy['skip-cert-verify']}`);
+                        }
+                        if (proxy.alpn && !proxy.tls) {
+                            parts.push(`alpn: [${proxy.alpn.map(a => `"${a}"`).join(', ')}]`);
+                        }
                     }
 
                     if (proxy.reality && proxy['reality-opts']) {
