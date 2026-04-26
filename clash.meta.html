@@ -3313,6 +3313,7 @@ module.exports.generate = (config, { yaml }) => {
                             try {
                                 const data = JSON.parse(block);
                                 let res = this.parseV2rayJSON(data);
+                                if (res.length === 0) res = this.parseSingBoxJSON(data);
                                 if (res.length === 0) res = this.parseRawProxyJSON(data);
                                 if (res.length > 0) {
                                     allProxies = allProxies.concat(res);
@@ -3631,6 +3632,131 @@ module.exports.generate = (config, { yaml }) => {
                     } else if (data && typeof data === 'object') {
                         processObject(data);
                     }
+                    return results;
+                }
+
+                // 解析 sing-box JSON 格式（支持 anytls/trojan/vless/vmess/ss/hysteria2/tuic 等）
+                parseSingBoxJSON(data) {
+                    const results = [];
+                    // 过滤掉非出站代理的系统出站
+                    const skipTypes = ['direct', 'block', 'dns', 'selector', 'urltest', 'loadbalance', 'tun', 'socks', 'http', 'mixed', 'redirect', 'tproxy'];
+
+                    const processOutbound = (ob) => {
+                        if (!ob || typeof ob !== 'object') return;
+                        const type = (ob.type || '').toLowerCase();
+                        if (skipTypes.includes(type)) return;
+                        // 必须有服务器地址才算有效节点
+                        if (!ob.server) return;
+
+                        try {
+                            const proxy = {
+                                name: ob.tag || ob.server,
+                                type: type,
+                                server: ob.server,
+                                port: parseInt(ob.server_port || ob.port) || 443,
+                                udp: true
+                            };
+
+                            // 提取 TLS 信息（sing-box 的 tls 字段）
+                            if (ob.tls && typeof ob.tls === 'object') {
+                                proxy.tls = ob.tls.enabled !== false;
+                                if (ob.tls.server_name) proxy.sni = ob.tls.server_name;
+                                if (ob.tls.insecure) proxy['skip-cert-verify'] = true;
+                                if (ob.tls.alpn) proxy.alpn = ob.tls.alpn;
+                            }
+
+                            switch (type) {
+                                case 'anytls':
+                                    proxy.password = ob.password || '';
+                                    break;
+                                case 'trojan':
+                                    proxy.password = ob.password || '';
+                                    if (!proxy.tls) proxy.tls = true;
+                                    break;
+                                case 'vless':
+                                    proxy.uuid = ob.uuid || '';
+                                    proxy.cipher = 'none';
+                                    if (ob.flow) proxy.flow = ob.flow;
+                                    break;
+                                case 'vmess':
+                                    proxy.uuid = ob.uuid || '';
+                                    proxy.alterId = ob.alter_id || 0;
+                                    proxy.cipher = ob.security || 'auto';
+                                    break;
+                                case 'shadowsocks':
+                                    proxy.type = 'ss';
+                                    proxy.cipher = ob.method || 'aes-256-gcm';
+                                    proxy.password = ob.password || '';
+                                    if (ob.plugin) proxy.plugin = ob.plugin;
+                                    break;
+                                case 'hysteria':
+                                    proxy.auth = ob.auth_str || ob.password || '';
+                                    proxy.up = ob.up_mbps ? ob.up_mbps + ' Mbps' : '';
+                                    proxy.down = ob.down_mbps ? ob.down_mbps + ' Mbps' : '';
+                                    break;
+                                case 'hysteria2':
+                                    proxy.password = ob.password || '';
+                                    if (ob.obfs && ob.obfs.type) {
+                                        proxy.obfs = ob.obfs.type;
+                                        if (ob.obfs.password) proxy['obfs-password'] = ob.obfs.password;
+                                    }
+                                    break;
+                                case 'tuic':
+                                    proxy.uuid = ob.uuid || '';
+                                    proxy.password = ob.password || '';
+                                    if (ob.congestion_control) proxy['congestion-controller'] = ob.congestion_control;
+                                    break;
+                                case 'wireguard':
+                                    proxy['private-key'] = ob.private_key || '';
+                                    if (ob.peers && ob.peers[0]) {
+                                        proxy['public-key'] = ob.peers[0].public_key || '';
+                                    }
+                                    if (ob.local_address) proxy['local-address'] = ob.local_address;
+                                    break;
+                                case 'socks':
+                                    proxy.type = 'socks5';
+                                    if (ob.username) proxy.username = ob.username;
+                                    if (ob.password) proxy.password = ob.password;
+                                    break;
+                                default:
+                                    // 未知协议保留原始 type，能显示在列表中即可
+                                    break;
+                            }
+
+                            // 传输层（transport 字段）
+                            if (ob.transport && typeof ob.transport === 'object') {
+                                const t = ob.transport;
+                                const ttype = (t.type || '').toLowerCase();
+                                if (ttype === 'ws' || ttype === 'websocket') {
+                                    proxy.network = 'ws';
+                                    proxy['ws-opts'] = {
+                                        path: t.path || '/',
+                                        headers: t.headers || {}
+                                    };
+                                } else if (ttype === 'grpc') {
+                                    proxy.network = 'grpc';
+                                    proxy['grpc-opts'] = { 'grpc-service-name': t.service_name || '' };
+                                } else if (ttype === 'http') {
+                                    proxy.network = 'h2';
+                                    proxy['h2-opts'] = { path: t.path || '/', host: t.host || [] };
+                                }
+                            }
+
+                            results.push(proxy);
+                        } catch (e) {
+                            console.warn('parseSingBoxJSON: 解析单个出站失败', ob.tag, e);
+                        }
+                    };
+
+                    // 支持完整 sing-box 配置文件（含 outbounds 数组）或直接是 outbounds 数组
+                    if (data && Array.isArray(data.outbounds)) {
+                        data.outbounds.forEach(processOutbound);
+                    } else if (Array.isArray(data)) {
+                        data.forEach(processOutbound);
+                    } else if (data && data.type && data.server) {
+                        processOutbound(data);
+                    }
+
                     return results;
                 }
 
@@ -5983,7 +6109,8 @@ module.exports.generate = (config, { yaml }) => {
                     const typeColors = {
                         'VLESS': '#6c5ce7', 'VMESS': '#00b894', 'TROJAN': '#e17055',
                         'SS': '#0984e3', 'SSR': '#a29bfe', 'HYSTERIA2': '#fd79a8',
-                        'HYSTERIA': '#e84393', 'TUIC': '#00cec9', 'WIREGUARD': '#636e72'
+                        'HYSTERIA': '#e84393', 'TUIC': '#00cec9', 'WIREGUARD': '#636e72',
+                        'ANYTLS': '#f39c12'
                     };
 
                     // 生成统计 HTML
@@ -7569,11 +7696,19 @@ module.exports.generate = (config, { yaml }) => {
                         if (proxy.auth) parts.push(`auth: ${quote(proxy.auth)}`);
                         if (proxy.up) parts.push(`up: ${quote(proxy.up)}`);
                         if (proxy.down) parts.push(`down: ${quote(proxy.down)}`);
+                    } else if (proxy.type === 'anytls') {
+                        if (proxy.password) parts.push(`password: ${quote(proxy.password)}`);
+                        // anytls 内置 TLS，单独处理 sni 和 skip-cert-verify
+                        const sni = proxy.sni || proxy.servername;
+                        if (sni) parts.push(`sni: ${quote(sni)}`);
+                        if (proxy['skip-cert-verify'] !== undefined) {
+                            parts.push(`skip-cert-verify: ${proxy['skip-cert-verify']}`);
+                        }
                     }
 
                     if (proxy.network) parts.push(`network: ${proxy.network}`);
 
-                    if (proxy.tls) {
+                    if (proxy.tls && proxy.type !== 'anytls' && proxy.type !== 'hysteria2' && proxy.type !== 'hysteria') {
                         parts.push(`tls: true`);
                         if (proxy.servername) parts.push(`servername: ${proxy.servername}`);
                         if (proxy.sni) parts.push(`sni: ${proxy.sni}`);
